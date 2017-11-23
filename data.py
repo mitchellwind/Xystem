@@ -11,7 +11,7 @@ import os.path
 import numpy as np
 import pandas as pd
 
-from event import MarketEvent
+from .event import MarketEvent
 
 
 class DataHandler(object):
@@ -48,21 +48,17 @@ class DataHandler(object):
 
 class HisDataHandler(DataHandler):
     """
-    providing datahandler object from historical data.
+    processing historical data from varies source with same methods.
     """
 
     def __init__(self, events, symbol_list):
         """
-        Initialises the historic data handler by requesting
-        the location of the CSV files and a list of symbols.
-
-        It will be assumed that all files are of the form
-        'symbol.csv', where symbol is a string in the list.
+        Initialises the historic data handler by requesting the list of symbols.
 
         Parameters:
         events - The Event Queue.
-        csv_dir - Absolute directory path to the CSV files.
         symbol_list - A list of symbol strings.
+        symbol_data - A generator with structure of {symbolA: DataFrameA, symbolB: DataFrameB,..}
         """
         self.events = events
         self.symbol_list = symbol_list
@@ -72,7 +68,80 @@ class HisDataHandler(DataHandler):
         self.continue_backtest = True
         self.bar_index = 0
 
+    # below use 3 different ways to get data: csv, oracle and wind
+    def symbol_data_from_csv(self, csv_dir, start_time=None, end_time=None):
+        """
+        get data from CSV files with format of 'datetime,O,H,L,C,V'
+        :param csv_dir: directory of CSV files;
+        :param start_time: time to start backtest;
+        :param end_time: time to end backtest
+        :return: self.symbol_data
+        """
+        comb_index = None
+        for s in self.symbol_list:
+            # Load the CSV file with no header information, indexed on date
+            self.symbol_data[s] = pd.read_csv(
+                os.path.join(csv_dir, '%s.csv' % s),
+                header=0, index_col=0, parse_dates=True,
+                names=[
+                    'datetime', 'open', 'high',
+                    'low', 'close', 'volume'
+                ]
+            )
 
+            # Combine the index to pad forward values
+            if comb_index is None:
+                comb_index = self.symbol_data[s].index
+            else:
+                comb_index.union(self.symbol_data[s].index)
+
+            # Set the latest symbol_data to None
+            self.latest_symbol_data[s] = []
+
+        # Reindex the dataframes
+        for s in self.symbol_list:
+            self.symbol_data[s] = self.symbol_data[s].reindex(index=comb_index, method='pad')
+            # slice comb_index with start_time and end_time
+            if start_time:
+                try:
+                    self.symbol_data[s] = self.symbol_data[s][start_time:]
+                except KeyError:
+                    print('No historical data for start time')
+            if end_time:
+                try:
+                    self.symbol_data[s] = self.symbol_data[s][:end_time]
+                except KeyError:
+                    print('No historical data for end time')
+            self.symbol_data[s] = self.symbol_data[s].iterrows()
+
+    def symbol_data_from_oracle(self, start_time=None, end_time=None):
+        """
+        :param start_time: time to start backtest;
+        :param end_time: time to end backtest
+        :return: self.symbol_data
+        """
+        pass
+
+    def symbol_data_from_wind(self, start_time=None, end_time=None):
+        """
+        :param start_time: time to start backtest;
+        :param end_time: time to end backtest
+        :return: self.symbol_data
+        """
+        from WindPy import w
+        w.start()
+        for s in self.symbol_list:
+            # import data from wind
+            wsd_data = w.wsd(s, "open,high,low,close,volume",
+                             start_time, end_time, "Fill=Previous")
+            df = pd.DataFrame(wsd_data.Data,
+                              index=wsd_data.Fields,
+                              columns=pd.to_datetime(wsd_data.Times)
+                              ).T
+            df.columns = ['open', 'high', 'low', 'close', 'volume']
+            df.index.name = 'datetime'
+            self.symbol_data[s] = df.iterrows()
+            self.latest_symbol_data[s] = []
 
     def _get_new_bar(self, symbol):
         """
@@ -81,17 +150,20 @@ class HisDataHandler(DataHandler):
         for b in self.symbol_data[symbol]:
             yield b
 
-    def get_latest_bar(self, symbol):
+    def update_bars(self):
         """
-        Returns the last bar from the latest_symbol list.
+        Pushes the latest bar to the latest_symbol_data structure
+        for all symbols in the symbol list.
         """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return bars_list[-1]
+        for s in self.symbol_list:
+            try:
+                bar = next(self._get_new_bar(s))
+            except StopIteration:
+                self.continue_backtest = False
+            else:
+                if bar is not None:
+                    self.latest_symbol_data[s].append(bar)
+        self.events.put(MarketEvent())
 
     def get_latest_bars(self, symbol, N=1):
         """
@@ -118,103 +190,6 @@ class HisDataHandler(DataHandler):
         else:
             return bars_list[-1][0]
 
-    def get_latest_bar_value(self, symbol, val_type):
-        """
-        Returns one of the Open, High, Low, Close, Volume or OI
-        values from the pandas Bar series object.
-        """
-        try:
-            bars_list = self.latest_symbol_data[symbol]
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return getattr(bars_list[-1][1], val_type)
-
-    def get_latest_bars_values(self, symbol, val_type, N=1):
-        """
-        Returns the last N bar values from the
-        latest_symbol list, or N-k if less available.
-        """
-        try:
-            bars_list = self.get_latest_bars(symbol, N)
-        except KeyError:
-            print("That symbol is not available in the historical data set.")
-            raise
-        else:
-            return np.array([getattr(b[1], val_type) for b in bars_list])
-
-    def update_bars(self):
-        """
-        Pushes the latest bar to the latest_symbol_data structure
-        for all symbols in the symbol list.
-        """
-        for s in self.symbol_list:
-            try:
-                bar = next(self._get_new_bar(s))
-            except StopIteration:
-                self.continue_backtest = False
-            else:
-                if bar is not None:
-                    self.latest_symbol_data[s].append(bar)
-        self.events.put(MarketEvent())
-
-
-class CSVHandler(HisDataHandler):
-    """
-    get data from local CSV files.
-    """
-        self._open_convert_csv_files()
-
-    def _open_convert_csv_files(self):
-        """
-        Opens the CSV files from the data directory, converting
-        them into pandas DataFrames within a symbol dictionary.
-
-        For this handler it will be assumed that the data is
-        taken from Yahoo. Thus its format will be respected.
-        """
-        comb_index = None
-        for s in self.symbol_list:
-            # Load the CSV file with no header information, indexed on date
-            self.symbol_data[s] = pd.read_csv(
-                os.path.join(self.csv_dir, '%s.csv' % s),
-                header=0, index_col=0, parse_dates=True,
-                names=[
-                    'datetime', 'open', 'high',
-                    'low', 'close', 'adj_close', 'volume'
-                ]
-            )
-
-            # Combine the index to pad forward values
-            if comb_index is None:
-                comb_index = self.symbol_data[s].index
-            else:
-                comb_index.union(self.symbol_data[s].index)
-
-            # Set the latest symbol_data to None
-            self.latest_symbol_data[s] = []
-
-        # Reindex the dataframes
-        for s in self.symbol_list:
-            self.symbol_data[s] = self.symbol_data[s].\
-                reindex(index=comb_index, method='pad').iterrows()
-
-class SQLDataHandler(DataHandler):
-    """
-    get data from local sql server
-    """
-    def __int__(self, events, symbol_list, start_time, end_time=None):
-        """
-        :param events: The Event Queue;
-        :param start_time: the start time of backtesting data;
-        :param symbol_list: list of symbols to be tested;
-
-        """
-        self.events = events
-        self.start_time = start_time
-        self.end_time = end_time
-        self.symbol_list = symbol_list
 
 
 
