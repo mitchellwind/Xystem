@@ -133,7 +133,7 @@ class HisDataHandler(DataHandler):
         for s in self.symbol_list:
             # import data from wind
             wsd_data = w.wsd(s, "open,high,low,close,volume",
-                             start_time, end_time, "Fill=Previous")
+                             start_time, end_time, "Fill=Previous;PriceAdj=F")
             df = pd.DataFrame(wsd_data.Data,
                               index=wsd_data.Fields,
                               columns=pd.to_datetime(wsd_data.Times)
