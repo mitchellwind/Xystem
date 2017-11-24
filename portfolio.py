@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import queue
 
-from .event import FillEvent,OrderEvent
+from .event import FillEvent, OrderEvent
 from abc import ABCMeta, abstractmethod
 from math import floor
 
@@ -41,25 +41,27 @@ class BasicPortfolio(Portfolio):
     不进行任何风险管理或仓位管理（这是不现实的！），仅供测试使用
     """
 
-    def __init__(self, bars, events, start_date, initial_capital=1.0e5):
+    def __init__(self, bars, events, start_time, initial_capital=1.0e6):
         """
         使用bars和event队列初始化portfolio，同时包含起始时间和初始资本
         参数：
         bars: DataHandler对象，使用当前市场数据
         events: Event queue对象
-        start_date: 组合起始的时间
+        start_time: 组合起始的时间
         initial_capital: 起始的资本
         """
         self.bars = bars
         self.events = events
         self.symbol_list = self.bars.symbol_list
-        self.start_date = start_date
-        self.current_datetime = start_date
+        self.start_time = start_time
+        self.current_datetime = start_time
         self.initial_capital = initial_capital
 
+        # position为仓位数量
         self.all_positions = self.construct_all_positions()
         self.current_positions = {s: 0 for s in self.symbol_list}
 
+        # holding为位持仓市值
         self.all_holdings = self.construct_all_holdings()
         self.current_holdings = self.construct_current_holdings()
 
@@ -72,7 +74,7 @@ class BasicPortfolio(Portfolio):
         且额外加入了datetime键
         """
         d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_date
+        d['datetime'] = self.start_time
         return [d]
 
     def construct_all_holdings(self):
@@ -81,7 +83,7 @@ class BasicPortfolio(Portfolio):
         包括现金、累计费率和合计值的键
         """
         d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_date
+        d['datetime'] = self.start_time
         d['cash'] = self.initial_capital
         d['commission'] = 0.0
         d['total'] = self.initial_capital
@@ -93,7 +95,7 @@ class BasicPortfolio(Portfolio):
         和construct_all_holdings()唯一不同的是返回字典，而非字典的列表
         """
         d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_date
+        d['datetime'] = self.start_time
         d['cash'] = self.initial_capital
         d['commission'] = 0.0
         d['total'] = self.initial_capital
@@ -104,32 +106,42 @@ class BasicPortfolio(Portfolio):
         用于追踪新的持仓市值
         向持仓头寸中加入新的纪录，也就是刚结束的这根完整k bar，bar的时间理解成endTime
         从events队列中使用BarEvent
+        bars
         """
         bars = {}
 
-        for sym in self.symbol_list:
-            bars[sym] = self.bars.get_latest_bars(sym, N=1)
+        for s in self.symbol_list:
+            bars[s] = self.bars.get_latest_bars(s, N=1)
 
-        self.current_datetime = bars[self.symbol_list[0]][0][1]
+        latest_datetime = bars[self.symbol_list[0]][-1][0]
 
+        # Update positions
+        # ================
         dp = {s: 0 for s in self.symbol_list}
-        dp['datetime'] = self.current_datetime
+        dp['datetime'] = latest_datetime
 
         for s in self.symbol_list:
             dp[s] = self.current_positions[s]
 
+        # Append the current positions
         self.all_positions.append(dp)
 
+        # Update holdings
+        # ===============
         dh = {s: 0 for s in self.symbol_list}
-        dh['datetime'] = self.current_datetime
+        dh['datetime'] = latest_datetime
         dh['cash'] = self.current_holdings['cash']
         dh['commission'] = self.current_holdings['commission']
         dh['total'] = self.current_holdings['cash']
+
         for s in self.symbol_list:
-            market_value = self.current_positions[s] * bars[s][0][5]
+            # each bar is a tuple like (datetime, OHLCV), where OHLCV is a Pandas Serie
+            # so the close price should be get by bar[1]['close']
+            market_value = self.current_positions[s] * bars[s][-1][1]['close']
             dh[s] = market_value
             dh['total'] += market_value
 
+        # Append the current holdings
         self.all_holdings.append(dh)
 
     def update_positions_from_fill(self, fill):

@@ -154,6 +154,7 @@ class HisDataHandler(DataHandler):
         """
         Pushes the latest bar to the latest_symbol_data structure
         for all symbols in the symbol list.
+        each bar is a tuple like (datetime, OHLCV), where OHLCV is a Pandas Serie
         """
         for s in self.symbol_list:
             try:
