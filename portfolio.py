@@ -9,81 +9,66 @@ import pandas as pd
 import queue
 
 from .event import FillEvent, OrderEvent
+from .performance import create_sharpe_ratio, create_drawdowns
 from abc import ABCMeta, abstractmethod
 from math import floor
 
 
 class Portfolio(object):
     """
-    Portfolio类处理头寸和持仓市值
-    目前以Bar来计算，可以是秒、分钟、5分钟、30分钟、60分钟等的K线
-    """
-    __metaclass__ = ABCMeta
+    The Portfolio class handles the positions and market
+    value of all instruments at a resolution of a "bar",
+    i.e. secondly, minutely, 5-min, 30-min, 60 min or EOD.
 
-    @abstractmethod
-    def update_signal(self, event):
-        """
-        基于portfolio的管理逻辑，使用SignalEvent产生新的orders
-        """
-        raise NotImplementedError("Should implement update_signal()!")
+    The positions DataFrame stores a time-index of the
+    quantity of positions held.
 
-    @abstractmethod
-    def update_fill(self, event):
-        """
-        从FillEvent中更新组合当前的头寸和持仓市值
-        """
-        raise NotImplementedError("Should implement update_fill()!")
-
-
-class BasicPortfolio(Portfolio):
-    """
-    BasicPortfolio发送orders给brokerage对象，这里简单地使用固定的数量，
-    不进行任何风险管理或仓位管理（这是不现实的！），仅供测试使用
+    The holdings DataFrame stores the cash and total market
+    holdings value of each symbol for a particular
+    time-index, as well as the percentage change in
+    portfolio total across bars.
     """
 
-    def __init__(self, bars, events, start_time, initial_capital=1.0e6):
+    def __init__(self, bars, events, start_date, initial_capital=1e6):
         """
-        使用bars和event队列初始化portfolio，同时包含起始时间和初始资本
-        参数：
-        bars: DataHandler对象，使用当前市场数据
-        events: Event queue对象
-        start_time: 组合起始的时间
-        initial_capital: 起始的资本
+        Initialises the portfolio with bars and an event queue.
+        Also includes a starting datetime index and initial capital
+        (USD unless otherwise stated).
+
+        Parameters:
+        bars - The DataHandler object with current market data.
+        events - The Event Queue object.
+        start_date - The start date (bar) of the portfolio.
+        initial_capital - The starting capital in USD.
         """
         self.bars = bars
         self.events = events
         self.symbol_list = self.bars.symbol_list
-        self.start_time = start_time
-        self.current_datetime = start_time
+        self.start_date = start_date
         self.initial_capital = initial_capital
 
-        # position为仓位数量
         self.all_positions = self.construct_all_positions()
         self.current_positions = {s: 0 for s in self.symbol_list}
 
-        # holding为位持仓市值
         self.all_holdings = self.construct_all_holdings()
         self.current_holdings = self.construct_current_holdings()
 
-        self.all_signals = []
-        self.all_trades = []
-
     def construct_all_positions(self):
         """
-        构建头寸列表，其元素为通过字典解析产生的字典，每个symbol键的值为零
-        且额外加入了datetime键
+        initializes the positions list using the start_date
+        to determine when the time index will begin.
         """
-        d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_time
+        d = {s:0 for s in self.symbol_list}
+        d['datetime'] = self.start_date
         return [d]
 
     def construct_all_holdings(self):
         """
-        构建全部持仓市值
-        包括现金、累计费率和合计值的键
+        initializes the holdings list using the start_date
+        to determine when the time index will begin.
         """
         d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_time
+        d['datetime'] = self.start_date
         d['cash'] = self.initial_capital
         d['commission'] = 0.0
         d['total'] = self.initial_capital
@@ -91,29 +76,25 @@ class BasicPortfolio(Portfolio):
 
     def construct_current_holdings(self):
         """
-        构建当前持仓市值
-        和construct_all_holdings()唯一不同的是返回字典，而非字典的列表
+        This initializes the dictionary which will hold the instantaneous
+        value of the portfolio across all symbols.
         """
         d = {s: 0 for s in self.symbol_list}
-        d['datetime'] = self.start_time
         d['cash'] = self.initial_capital
         d['commission'] = 0.0
         d['total'] = self.initial_capital
         return d
 
-    def update_timeindex(self):
+    def update_timeindex(self, event):
         """
-        用于追踪新的持仓市值
-        向持仓头寸中加入新的纪录，也就是刚结束的这根完整k bar，bar的时间理解成endTime
-        从events队列中使用BarEvent
-        bars
+        Adds a new record to the positions matrix for the current
+        market data bar. This reflects the PREVIOUS bar, i.e. all
+        current market data at this stage is known (OHLCV).
+
+        Makes use of a MarketEvent from the events queue.
         """
-        bars = {}
 
-        for s in self.symbol_list:
-            bars[s] = self.bars.get_latest_bars(s, N=1)
-
-        latest_datetime = bars[self.symbol_list[0]][-1][0]
+        latest_datetime = self.bars.get_latest_bar_datetime(self.symbol_list[0])
 
         # Update positions
         # ================
@@ -135,125 +116,141 @@ class BasicPortfolio(Portfolio):
         dh['total'] = self.current_holdings['cash']
 
         for s in self.symbol_list:
-            # each bar is a tuple like (datetime, OHLCV), where OHLCV is a Pandas Serie
-            # so the close price should be get by bar[1]['close']
-            market_value = self.current_positions[s] * bars[s][-1][1]['close']
+            # Approximation to the real value
+            market_value = self.current_positions[s] * \
+                           self.bars.get_latest_bar_value(s, "adj_close")
             dh[s] = market_value
             dh['total'] += market_value
 
         # Append the current holdings
         self.all_holdings.append(dh)
 
+    # ======================
+    # FILL/POSITION HANDLING
+    # ======================
+
     def update_positions_from_fill(self, fill):
         """
-        从FillEvent对象中读取数据以更新头寸position
-        参数：
-        fill: FillEvent对象
+        Takes a Fill object and updates the position matrix to
+        reflect the new position.
+
+        Parameters:
+        fill - The Fill object to update the positions with.
         """
+        # Check whether the fill is a buy or sell
         fill_dir = 0
         if fill.direction == 'BUY':
             fill_dir = 1
         if fill.direction == 'SELL':
             fill_dir = -1
 
+        # Update positions list with new quantities
         self.current_positions[fill.symbol] += fill_dir * fill.quantity
 
     def update_holdings_from_fill(self, fill):
         """
-        从FillEvent对象中读取数据以更新头寸市值 (holdings value)
-        参数：
-        fill: FillEvent对象
+        Takes a Fill object and updates the holdings matrix to
+        reflect the holdings value.
+
+        Parameters:
+        fill - The Fill object to update the holdings with.
         """
+        # Check whether the fill is a buy or sell
         fill_dir = 0
         if fill.direction == 'BUY':
             fill_dir = 1
         if fill.direction == 'SELL':
             fill_dir = -1
 
-        fill_price = fill.fill_price
-        cost = fill_dir * fill_price * fill.quantity
-
+        # Update holdings list with new quantities
+        fill_cost = self.bars.get_latest_bar_value(
+            fill.symbol, "adj_close"
+        )
+        cost = fill_dir * fill_cost * fill.quantity
         self.current_holdings[fill.symbol] += cost
         self.current_holdings['commission'] += fill.commission
         self.current_holdings['cash'] -= (cost + fill.commission)
-        self.current_holdings['total'] -= fill.commission
-
-    def record_trades_from_fill(self, fill):
-        """
-        从FillEvent对象中读取全部数据作为交易记录
-        参数：
-        fill: FillEvent对象
-        """
-        current_trade = {}
-        current_trade['datetime'] = fill.timeindex
-        current_trade['symbol'] = fill.symbol
-        current_trade['exchange'] = fill.exchange
-        current_trade['quantity'] = fill.quantity
-        current_trade['direction'] = fill.direction
-        current_trade['fill_price'] = fill.fill_price
-        current_trade['commission'] = fill.commission
-
-        self.all_trades.append(current_trade)
+        self.current_holdings['total'] -= (cost + fill.commission)
 
     def update_fill(self, event):
         """
-        从FillEvent中更新组合的头寸和市值
+        Updates the portfolio current positions and holdings
+        from a FillEvent.
         """
         if event.type == 'FILL':
             self.update_positions_from_fill(event)
             self.update_holdings_from_fill(event)
-            self.record_trades_from_fill(event)
 
     def generate_naive_order(self, signal):
         """
-        此函数未采取风险管理和仓位控制，实际流程应该是信号->风险控制->下单指令
+        Simply files an Order object as a constant quantity
+        sizing of the signal object, without risk management or
+        position sizing considerations.
+
+        Parameters:
+        signal - The tuple containing Signal information.
         """
         order = None
+
         symbol = signal.symbol
         direction = signal.signal_type
         strength = signal.strength
 
-        order_type = 'MKT'
-        target_holdings = self.current_holdings['total'] * strength * (1 if direction == 'LONG' else -1)
-        cur_holdings = self.current_holdings[symbol]
+        mkt_quantity = 100
         cur_quantity = self.current_positions[symbol]
-        delta_holdings = target_holdings - cur_holdings
-        price = self.bars.get_latest_bar(symbol).close
+        order_type = 'MKT'
 
-        if symbol.startswith(('0', '3', '6')):
-            mkt_quantity = ((delta_holdings / price) // 100) * 100
-        else:
-            mkt_quantity = delta_holdings // price
+        if direction == 'LONG' and cur_quantity == 0:
+            order = OrderEvent(symbol, order_type, mkt_quantity, 'BUY')
+        if direction == 'SHORT' and cur_quantity == 0:
+            order = OrderEvent(symbol, order_type, mkt_quantity, 'SELL')
 
-        if direction == 'LONG':
-            order = OrderEvent(symbol, order_type, abs(mkt_quantity), 'BUY' if mkt_quantity > 0 else 'SELL')
-        elif direction == 'SHORT':
-            order = OrderEvent(symbol, order_type, abs(mkt_quantity), 'SELL' if mkt_quantity < 0 else 'BUY')
-        elif direction == 'EXIT':
-            order = OrderEvent(symbol, order_type, abs(cur_quantity), 'SELL' if cur_quantity > 0 else 'BUY')
-        else:
-            raise ValueError('Unknown direction type: %s' % direction)
-
+        if direction == 'EXIT' and cur_quantity > 0:
+            order = OrderEvent(symbol, order_type, abs(cur_quantity), 'SELL')
+        if direction == 'EXIT' and cur_quantity < 0:
+            order = OrderEvent(symbol, order_type, abs(cur_quantity), 'BUY')
         return order
-
-    def record_current_signal(self, signal):
-        """
-        从SignalEvent对象中读取全部数据作为信号记录
-        """
-        current_signal = {}
-        current_signal['symbol'] = signal.symbol
-        current_signal['datetime'] = signal.datetime
-        current_signal['signal_type'] = signal.signal_type
-        current_signal['strategy_id'] = signal.strategy_id
-        current_signal['strength'] = signal.strength
-
-        self.all_signals.append(current_signal)
 
     def update_signal(self, event):
         """
-        基于组合管理的逻辑，通过SignalEvent对象来产生新的orders
+        Acts on a SignalEvent to generate new orders
+        based on the portfolio logic.
         """
         if event.type == 'SIGNAL':
-            self.record_current_signal(event)
             order_event = self.generate_naive_order(event)
             self.events.put(order_event)
+
+    # ========================
+    # POST-BACKTEST STATISTICS
+    # ========================
+
+    def create_equity_curve_dataframe(self):
+        """
+        Creates a pandas DataFrame from the all_holdings
+        list of dictionaries.
+        """
+        curve = pd.DataFrame(self.all_holdings)
+        curve.set_index('datetime', inplace=True)
+        curve['returns'] = curve['total'].pct_change()
+        curve['equity_curve'] = (1.0 + curve['returns']).cumprod()
+        self.equity_curve = curve
+
+    def output_summary_stats(self):
+        """
+        Creates a list of summary statistics for the portfolio.
+        """
+        total_return = self.equity_curve['equity_curve'][-1]
+        returns = self.equity_curve['returns']
+        pnl = self.equity_curve['equity_curve']
+
+        sharpe_ratio = create_sharpe_ratio(returns)
+        drawdown, max_dd, dd_duration = create_drawdowns(pnl)
+        self.equity_curve['drawdown'] = drawdown
+
+        stats = [("Total Return", "%0.2f%%" % ((total_return - 1.0) * 100.0)),
+                 ("Sharpe Ratio", "%0.2f" % sharpe_ratio),
+                 ("Max Drawdown", "%0.2f%%" % (max_dd * 100.0)),
+                 ("Drawdown Duration", "%d" % dd_duration)]
+
+        self.equity_curve.to_csv('equity.csv')
+        return stats
